@@ -2,14 +2,31 @@ const path = require('path');
 const tf = require('@tensorflow/tfjs-node');
 const nsfwjs = require('nsfwjs');
 
-const BLOCKED_LABELS = new Set(['Porn', 'Hentai', 'Sexy']);
+// Kelas yang dianggap NSFW, dengan default threshold per kategori.
+// Porn/Hentai dibuat ketat karena false negative lebih mahal.
+// Sexy dibuat longgar karena kelas ini paling noisy (pakaian minim, pose biasa).
+const DEFAULT_THRESHOLDS = {
+  Porn: 0.3,
+  Hentai: 0.3,
+  Sexy: 0.8
+};
+
+function resolveThresholds() {
+  const fallback = Number(process.env.NSFW_THRESHOLD);
+  return Object.fromEntries(Object.entries(DEFAULT_THRESHOLDS).map(([className, defaultValue]) => {
+    const specific = Number(process.env[`NSFW_THRESHOLD_${className.toUpperCase()}`]);
+    if (Number.isFinite(specific)) return [className, specific];
+    if (Number.isFinite(fallback)) return [className, fallback];
+    return [className, defaultValue];
+  }));
+}
 
 class Moderator {
   constructor() {
     this.model = null;
     this.loading = null;
     this.modelPath = process.env.NSFW_MODEL_PATH || undefined;
-    this.threshold = Number(process.env.NSFW_THRESHOLD || 0.5);
+    this.thresholds = resolveThresholds();
   }
 
   async load() {
@@ -36,17 +53,18 @@ class Moderator {
       const predictions = await model.classify(imageTensor);
       const scores = Object.fromEntries(predictions.map(({ className, probability }) => [className, probability]));
       const flagged = predictions.filter(({ className, probability }) => (
-        BLOCKED_LABELS.has(className) && probability >= this.threshold
+        className in this.thresholds && probability >= this.thresholds[className]
       ));
 
       return {
         is_nsfw: flagged.length > 0,
-        threshold: this.threshold,
+        thresholds: this.thresholds,
         predictions,
         scores,
         flagged_categories: flagged.map(({ className, probability }) => ({
           category: className,
-          probability
+          probability,
+          threshold: this.thresholds[className]
         }))
       };
     } finally {

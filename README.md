@@ -26,7 +26,19 @@ Model default dimuat ketika service mulai dan dapat memerlukan akses internet se
 curl -F image=@photo.jpg http://localhost:3003/moderate
 ```
 
-Response memiliki `is_nsfw`, `flagged_categories`, `scores`, dan seluruh `predictions`. Kategori `Porn`, `Hentai`, atau `Sexy` dianggap ter-flag jika probabilitasnya minimal `NSFW_THRESHOLD` (default `0.5`).
+Response memiliki `is_nsfw`, `flagged_categories`, `scores`, `thresholds`, dan seluruh `predictions`. Kategori `Porn`, `Hentai`, atau `Sexy` ter-flag jika probabilitasnya minimal threshold kategori tersebut.
+
+### Threshold
+
+Threshold diatur per kategori. Default:
+
+| Kategori | Default | Alasan |
+| --- | --- | --- |
+| `Porn` | `0.3` | ketat, false negative lebih mahal |
+| `Hentai` | `0.3` | ketat, false negative lebih mahal |
+| `Sexy` | `0.8` | longgar, kelas paling noisy (pakaian minim/pose biasa) |
+
+Override lewat `NSFW_THRESHOLD_PORN`, `NSFW_THRESHOLD_HENTAI`, `NSFW_THRESHOLD_SEXY`. `NSFW_THRESHOLD` dipakai sebagai fallback untuk kategori yang tidak diset — mengisinya akan menyamakan semua kategori, jadi biarkan kosong bila ingin default di atas.
 
 ## PM2 production
 
