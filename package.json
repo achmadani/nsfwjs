@@ -1,0 +1,25 @@
+{
+  "name": "nsfw-moderation-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "REST API for NSFW image moderation using NSFWJS and TensorFlow.js",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "lint": "node --check src/server.js && node --check src/moderator.js",
+    "prepare-model": "node scripts/prepare-model.js"
+  },
+  "engines": {
+    "node": ">=16.14.0 <23"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "4.22.0",
+    "cors": "2.8.5",
+    "dotenv": "16.6.1",
+    "express": "4.21.2",
+    "helmet": "8.1.0",
+    "multer": "2.0.2",
+    "nsfwjs": "4.2.1"
+  }
+}
