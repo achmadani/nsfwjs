@@ -4,3 +4,5 @@ npm-debug.log*
 models/
 *.tgz
 .DS_Store
+_tmp*
+data/

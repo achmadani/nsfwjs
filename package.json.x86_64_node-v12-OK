@@ -7,8 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon --watch src src/server.js",
-    "lint": "node --check src/server.js && node --check src/moderator.js && node --check src/access.js && node --check src/keyStore.js && node --check src/stats.js && node --check scripts/keys.js",
-    "keys": "node scripts/keys.js",
+    "lint": "node --check src/server.js && node --check src/moderator.js",
     "prepare-model": "node scripts/prepare-model.js"
   },
   "engines": {

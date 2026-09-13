@@ -45,6 +45,10 @@ class Moderator {
     return Boolean(this.model);
   }
 
+  tensorMemory() {
+    return tf.memory();
+  }
+
   async classify(buffer) {
     const model = await this.load();
     let imageTensor;

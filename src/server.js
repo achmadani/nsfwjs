@@ -5,12 +5,30 @@ const cors = require('cors');
 const helmet = require('helmet');
 const multer = require('multer');
 const Moderator = require('./moderator');
+const KeyStore = require('./keyStore');
+const { createAccessMiddleware } = require('./access');
+const { RequestStats, ResourceMonitor } = require('./stats');
+
+function parseBoolean(value, defaultValue) {
+  if (value === undefined || value === '') return defaultValue;
+  return !['0', 'false', 'no', 'off'].includes(String(value).trim().toLowerCase());
+}
+
+function parseTrustProxy(value) {
+  if (value === undefined || value === '') return 'loopback';
+  if (['true', 'false'].includes(value)) return value === 'true';
+  if (/^\d+$/.test(value)) return Number(value);
+  return value;
+}
 
 const port = Number(process.env.PORT || 3003);
 const host = process.env.HOST || '0.0.0.0';
 const maxFileSize = Number(process.env.MAX_FILE_SIZE_MB || 10) * 1024 * 1024;
 const allowedMimeTypes = new Set((process.env.ALLOWED_MIME_TYPES || 'image/jpeg,image/png,image/webp,image/gif')
   .split(',').map((value) => value.trim()).filter(Boolean));
+const localBypass = parseBoolean(process.env.LOCAL_BYPASS, true);
+const apiKeysFile = process.env.API_KEYS_FILE || 'data/api-keys.json';
+const resourceSampleMs = Math.max(200, Number(process.env.RESOURCE_SAMPLE_MS || 1000));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -22,11 +40,30 @@ const upload = multer({
 
 const app = express();
 const moderator = new Moderator();
+const keyStore = new KeyStore(apiKeysFile);
+const stats = new RequestStats();
+const monitor = new ResourceMonitor({
+  intervalMs: resourceSampleMs,
+  isReady: () => moderator.isReady(),
+  tensorMemory: () => (moderator.isReady() ? moderator.tensorMemory() : null)
+});
 
 app.disable('x-powered-by');
+// Hanya dipakai untuk menampilkan IP client (request.ip); tidak dipakai untuk
+// menentukan akses localhost.
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
+app.use(stats.middleware());
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: `${Math.ceil(maxFileSize / 1024 / 1024)}mb` }));
+// Autentikasi dijalankan sebelum body diparse/diupload, supaya request tanpa
+// key tidak sempat membebani memori server.
+app.use(createAccessMiddleware({
+  keyStore,
+  stats,
+  localBypass,
+  localOnlyPrefixes: ['/admin']
+}));
+app.use(express.json({ limit: '100kb' }));
 
 app.get('/health', (request, response) => {
   response.json({
@@ -44,7 +81,8 @@ app.post('/moderate', upload.single('image'), async (request, response, next) =>
       });
     }
 
-    const result = await moderator.classify(request.file.buffer);
+    const result = await monitor.track(() => moderator.classify(request.file.buffer));
+    stats.recordModeration(request.access, result);
     return response.json({
       ...result,
       filename: request.file.originalname,
@@ -52,8 +90,47 @@ app.post('/moderate', upload.single('image'), async (request, response, next) =>
       size_bytes: request.file.size
     });
   } catch (error) {
+    stats.recordModerationError();
     return next(error);
   }
+});
+
+// ---- Route khusus localhost ----
+
+app.get('/admin/report', (request, response) => {
+  response.json({
+    generated_at: new Date().toISOString(),
+    model_loaded: moderator.isReady(),
+    ...stats.report(),
+    resources: monitor.report({ includeHistory: parseBoolean(request.query.history, false) })
+  });
+});
+
+app.get('/admin/keys', (request, response) => {
+  response.json({ keys: keyStore.list() });
+});
+
+app.post('/admin/keys', (request, response) => {
+  try {
+    const created = keyStore.create(request.body && request.body.name);
+    return response.status(201).json({
+      ...created.entry,
+      key: created.key,
+      warning: 'Store this key now. It cannot be shown again.'
+    });
+  } catch (error) {
+    return response.status(400).json({ error: error.message });
+  }
+});
+
+app.delete('/admin/keys/:id', (request, response) => {
+  const revoked = keyStore.revoke(request.params.id);
+  if (!revoked) return response.status(404).json({ error: 'Active key not found.' });
+  return response.json(revoked);
+});
+
+app.use((request, response) => {
+  response.status(404).json({ error: 'Not found.' });
 });
 
 app.use((error, request, response, next) => {
@@ -64,6 +141,12 @@ app.use((error, request, response, next) => {
   if (error && error.message === 'Unexpected field') {
     return response.status(400).json({ error: 'Use multipart field "image".' });
   }
+  if (error && error.type === 'entity.parse.failed') {
+    return response.status(400).json({ error: 'Invalid JSON body.' });
+  }
+  if (error && error.type === 'entity.too.large') {
+    return response.status(413).json({ error: 'Request body too large.' });
+  }
   if (error) {
     console.error(error);
     return response.status(422).json({ error: 'The file could not be decoded or classified.' });
@@ -71,8 +154,11 @@ app.use((error, request, response, next) => {
   return next();
 });
 
+monitor.start();
+
 const server = app.listen(port, host, () => {
   console.log(`NSFW moderation API listening on http://${host}:${port}`);
+  console.log(`Localhost bypass: ${localBypass ? 'enabled' : 'disabled'}; API keys: ${keyStore.filePath} (${keyStore.list().filter((key) => key.active).length} active)`);
   moderator.load().then(() => console.log('NSFWJS model loaded')).catch((error) => {
     console.error('Unable to load NSFWJS model:', error.message);
   });
@@ -80,6 +166,7 @@ const server = app.listen(port, host, () => {
 
 const shutdown = (signal) => {
   console.log(`${signal} received, shutting down`);
+  monitor.stop();
   server.close(() => process.exit(0));
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
