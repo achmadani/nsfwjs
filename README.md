@@ -76,7 +76,7 @@ Model default dimuat ketika service mulai dan dapat memerlukan akses internet se
 `POST /moderate` menerima `multipart/form-data` dengan field `image`:
 
 ```bash
-curl -F image=@photo.jpg http://localhost:3003/moderate
+curl -F image=@photo.jpg http://localhost:8005/moderate
 ```
 
 Dari luar, sertakan API key:
@@ -120,26 +120,333 @@ npm run keys -- revoke "Aplikasi Sekolah"
 Atau lewat route admin dari localhost:
 
 ```bash
-curl -H "Content-Type: application/json" -d '{"name":"Aplikasi Sekolah"}' http://127.0.0.1:3003/admin/keys
-curl http://127.0.0.1:3003/admin/keys
-curl -X DELETE http://127.0.0.1:3003/admin/keys/<id>
+curl -H "Content-Type: application/json" -d '{"name":"Aplikasi Sekolah"}' http://127.0.0.1:8005/admin/keys
+curl http://127.0.0.1:8005/admin/keys
+curl -X DELETE http://127.0.0.1:8005/admin/keys/<id>
 ```
 
-| Respons | `code` | Arti |
-| --- | --- | --- |
-| 401 | `missing_key` | tidak ada key |
-| 401 | `invalid_key` | key tidak dikenal |
-| 401 | `revoked_key` | key sudah dicabut |
-| 403 | `local_only` | route admin diakses dari luar |
-
 Autentikasi berjalan sebelum upload diproses, jadi request tanpa key ditolak tanpa file-nya sempat dibaca ke memori.
+
+### Integrasi dari aplikasi lain
+
+Ringkasan request:
+
+| | |
+| --- | --- |
+| Method & URL | `POST https://nsfw.example.com/moderate` |
+| Header wajib | `X-API-Key: nsfw_xxx` (atau `Authorization: Bearer nsfw_xxx`) |
+| Header disarankan | `Accept: application/json` |
+| Body | `multipart/form-data` |
+| Field | `image` — tepat satu file |
+| Tipe file | `image/jpeg`, `image/png`, `image/webp`, `image/gif` (atur lewat `ALLOWED_MIME_TYPES`) |
+| Ukuran maksimal | 10 MB (atur lewat `MAX_FILE_SIZE_MB`; samakan dengan `client_max_body_size` nginx) |
+| Response | selalu JSON (`Content-Type: application/json`) |
+
+Tidak ada parameter query. Input berupa URL gambar atau base64 **tidak** didukung — kirim file-nya.
+
+Panggil API ini **dari backend**, jangan dari JavaScript di browser atau aplikasi mobile: API key akan terlihat oleh siapa pun yang membuka DevTools atau membongkar aplikasinya.
+
+#### cURL
+
+```bash
+curl -X POST https://nsfw.example.com/moderate \
+  -H "X-API-Key: nsfw_xxx" \
+  -H "Accept: application/json" \
+  -F "image=@foto.jpg;type=image/jpeg"
+```
+
+Cek service (misalnya untuk monitoring):
+
+```bash
+curl -H "X-API-Key: nsfw_xxx" https://nsfw.example.com/health
+```
+
+```json
+{"status":"ok","model_loaded":true,"uptime_seconds":7}
+```
+
+`status` bernilai `loading` selama model belum termuat. Request `/moderate` yang masuk pada saat itu **tidak ditolak**, tetapi menunggu sampai model siap.
+
+#### PHP (5.5+, termasuk 5.6)
+
+```php
+<?php
+/**
+ * Kirim gambar ke NSFW moderation API.
+ * Kompatibel PHP 5.5+ (CURLFile).
+ *
+ * @return array ['ok' => bool, 'status' => int, 'code' => string|null, 'error' => string|null, 'data' => array|null]
+ */
+function nsfw_moderate($filePath, $originalName = null)
+{
+    $baseUrl = 'https://nsfw.example.com';   // ganti
+    $apiKey  = getenv('NSFW_API_KEY');       // simpan di env/config, jangan di-hardcode
+
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime  = finfo_file($finfo, $filePath);
+    finfo_close($finfo);
+
+    $ch = curl_init(rtrim($baseUrl, '/') . '/moderate');
+    curl_setopt_array($ch, array(
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => array(
+            'image' => new CURLFile($filePath, $mime, $originalName ? $originalName : basename($filePath)),
+        ),
+        CURLOPT_HTTPHEADER     => array(
+            'X-API-Key: ' . $apiKey,
+            'Accept: application/json',
+            'Expect:',                       // hindari jeda "100 Continue"
+        ),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT        => 30,
+    ));
+
+    $body   = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($body === false) {
+        return array('ok' => false, 'status' => 0, 'code' => 'network_error', 'error' => $curlError, 'data' => null);
+    }
+
+    $data = json_decode($body, true);
+    if ($status !== 200) {
+        return array(
+            'ok'     => false,
+            'status' => $status,
+            'code'   => isset($data['code']) ? $data['code'] : null,
+            'error'  => isset($data['error']) ? $data['error'] : 'HTTP ' . $status,
+            'data'   => $data,
+        );
+    }
+
+    return array('ok' => true, 'status' => 200, 'code' => null, 'error' => null, 'data' => $data);
+}
+```
+
+Pemakaian pada form upload (CodeIgniter / Laravel / PHP native):
+
+```php
+<?php
+$file = $_FILES['foto'];
+$result = nsfw_moderate($file['tmp_name'], $file['name']);
+
+if (!$result['ok']) {
+    // Service gagal/tidak bisa dihubungi. Tentukan kebijakan: tolak (aman) atau terima lalu review manual.
+    error_log('NSFW API: ' . $result['status'] . ' ' . $result['error']);
+    exit('Gambar belum bisa diverifikasi, coba lagi nanti.');
+}
+
+if ($result['data']['is_nsfw']) {
+    exit('Gambar ditolak karena mengandung konten tidak pantas.');
+}
+
+// Lolos — simpan file.
+move_uploaded_file($file['tmp_name'], $tujuan);
+```
+
+MIME dideteksi dari isi file (`finfo`), bukan dari ekstensi atau data kiriman browser — file bukan gambar yang di-rename jadi `.jpg` langsung ditolak dengan `400`.
+
+#### Node.js (8+, tanpa dependency)
+
+```js
+// Kirim gambar ke NSFW moderation API tanpa dependency.
+// Kompatibel Node.js 8+.
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const https = require('https');
+const crypto = require('crypto');
+const URL = require('url').URL;
+
+const MIME_TYPES = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
+
+function moderateImage(filePath, options) {
+  const url = new URL('/moderate', options.baseUrl);
+  const boundary = '----nsfw' + crypto.randomBytes(12).toString('hex');
+  const filename = options.filename || path.basename(filePath);
+  const mimeType = MIME_TYPES[path.extname(filename).toLowerCase()] || 'application/octet-stream';
+
+  const body = Buffer.concat([
+    Buffer.from(
+      '--' + boundary + '\r\n' +
+      'Content-Disposition: form-data; name="image"; filename="' + filename.replace(/"/g, '') + '"\r\n' +
+      'Content-Type: ' + mimeType + '\r\n\r\n'
+    ),
+    fs.readFileSync(filePath),
+    Buffer.from('\r\n--' + boundary + '--\r\n')
+  ]);
+
+  const transport = url.protocol === 'https:' ? https : http;
+
+  return new Promise((resolve) => {
+    const request = transport.request({
+      method: 'POST',
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      headers: {
+        'X-API-Key': options.apiKey,
+        'Accept': 'application/json',
+        'Content-Type': 'multipart/form-data; boundary=' + boundary,
+        'Content-Length': body.length
+      },
+      timeout: options.timeoutMs || 30000
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        let data = null;
+        try {
+          data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        } catch (error) {
+          data = null;
+        }
+        const ok = response.statusCode === 200;
+        resolve({
+          ok: ok,
+          status: response.statusCode,
+          code: ok ? null : (data && data.code) || null,
+          error: ok ? null : (data && data.error) || 'HTTP ' + response.statusCode,
+          data: data
+        });
+      });
+    });
+
+    request.on('timeout', () => request.destroy(new Error('Request timed out')));
+    request.on('error', (error) => resolve({ ok: false, status: 0, code: 'network_error', error: error.message, data: null }));
+    request.end(body);
+  });
+}
+
+module.exports = moderateImage;
+```
+
+Pemakaian:
+
+```js
+const moderateImage = require('./moderate');
+
+moderateImage('/tmp/upload/foto.jpg', {
+  baseUrl: 'https://nsfw.example.com',
+  apiKey: process.env.NSFW_API_KEY,
+  filename: 'foto.jpg',
+  timeoutMs: 30000
+}).then((result) => {
+  if (!result.ok) {
+    console.error('NSFW API gagal:', result.status, result.code, result.error);
+    return;
+  }
+  console.log(result.data.is_nsfw ? 'Diblokir' : 'Lolos');
+});
+```
+
+Contoh di atas menentukan MIME dari ekstensi file. Kalau file berasal dari upload user, validasi dulu bahwa isinya benar-benar gambar.
+
+#### Response sukses — `200 OK`
+
+Gambar lolos (`is_nsfw: false`):
+
+```json
+{
+  "is_nsfw": false,
+  "thresholds": { "Porn": 0.3, "Hentai": 0.3, "Sexy": 0.8 },
+  "predictions": [
+    { "className": "Sexy", "probability": 0.4606899917125702 },
+    { "className": "Neutral", "probability": 0.2623153626918793 },
+    { "className": "Drawing", "probability": 0.12814347445964813 },
+    { "className": "Hentai", "probability": 0.07721778005361557 },
+    { "className": "Porn", "probability": 0.0716334730386734 }
+  ],
+  "scores": {
+    "Sexy": 0.4606899917125702,
+    "Neutral": 0.2623153626918793,
+    "Drawing": 0.12814347445964813,
+    "Hentai": 0.07721778005361557,
+    "Porn": 0.0716334730386734
+  },
+  "flagged_categories": [],
+  "filename": "test.jpg",
+  "mime_type": "image/jpeg",
+  "size_bytes": 44622
+}
+```
+
+Gambar diblokir (`is_nsfw: true`). Contoh ini diambil dengan `NSFW_THRESHOLD_SEXY=0.5`:
+
+```json
+{
+  "is_nsfw": true,
+  "thresholds": { "Porn": 0.3, "Hentai": 0.3, "Sexy": 0.5 },
+  "predictions": [
+    { "className": "Sexy", "probability": 0.6956664323806763 },
+    { "className": "Neutral", "probability": 0.21039915084838867 },
+    { "className": "Drawing", "probability": 0.04875286668539047 },
+    { "className": "Porn", "probability": 0.023141205310821533 },
+    { "className": "Hentai", "probability": 0.022040363401174545 }
+  ],
+  "scores": {
+    "Sexy": 0.6956664323806763,
+    "Neutral": 0.21039915084838867,
+    "Drawing": 0.04875286668539047,
+    "Porn": 0.023141205310821533,
+    "Hentai": 0.022040363401174545
+  },
+  "flagged_categories": [
+    { "category": "Sexy", "probability": 0.6956664323806763, "threshold": 0.5 }
+  ],
+  "filename": "big.jpg",
+  "mime_type": "image/jpeg",
+  "size_bytes": 409695
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `is_nsfw` | boolean | **keputusan akhir** — `true` jika minimal satu kategori mencapai threshold-nya |
+| `flagged_categories` | array | kategori yang menyebabkan blokir, beserta skor dan threshold yang dipakai; kosong jika lolos |
+| `thresholds` | object | threshold aktif di server saat request diproses |
+| `predictions` | array | 5 kelas beserta probabilitas, urut dari tertinggi |
+| `scores` | object | isi yang sama dengan `predictions`, dalam bentuk `{ kelas: probabilitas }` |
+| `filename`, `mime_type`, `size_bytes` | | metadata file yang diterima server |
+
+Probabilitas kelima kelas berjumlah ±1. `Neutral` dan `Drawing` adalah kelas aman; hanya `Porn`, `Hentai`, dan `Sexy` yang bisa memicu blokir. Cukup gunakan `is_nsfw` untuk keputusan, supaya perubahan threshold di server langsung berlaku tanpa mengubah aplikasi client.
+
+#### Response gagal
+
+Semua error berbentuk `{"error": "...", "code": "..."}`; `code` tidak selalu ada, jadi gunakan status HTTP sebagai acuan utama.
+
+| Status | `code` | Body | Penyebab | Tindakan client |
+| --- | --- | --- | --- | --- |
+| 400 | — | `{"error":"An image file is required in multipart field \"image\"."}` | tidak ada file, **atau** tipe file tidak didukung | perbaiki request; jangan diulang |
+| 400 | `LIMIT_UNEXPECTED_FILE` | `{"error":"Unexpected field","code":"LIMIT_UNEXPECTED_FILE"}` | nama field bukan `image`, atau lebih dari satu file | perbaiki nama field |
+| 401 | `missing_key` | `{"error":"API key required. Send it in the \"X-API-Key\" header.","code":"missing_key"}` | header key tidak dikirim | periksa konfigurasi |
+| 401 | `invalid_key` | `{"error":"Invalid API key.","code":"invalid_key"}` | key salah atau salah ketik | periksa konfigurasi |
+| 401 | `revoked_key` | `{"error":"API key has been revoked.","code":"revoked_key"}` | key sudah dicabut | minta key baru |
+| 403 | `local_only` | `{"error":"This route is only available from localhost.","code":"local_only"}` | mengakses `/admin/*` dari luar | tidak bisa; route khusus server |
+| 404 | — | `{"error":"Not found."}` | URL atau method salah (misalnya `GET /moderate`) | perbaiki URL/method |
+| 413 | `LIMIT_FILE_SIZE` | `{"error":"File too large","code":"LIMIT_FILE_SIZE"}` | file melebihi `MAX_FILE_SIZE_MB` | kecilkan gambar dulu |
+| 413 | — | halaman HTML nginx | file melebihi `client_max_body_size` nginx | kecilkan gambar dulu |
+| 422 | — | `{"error":"The file could not be decoded or classified."}` | file rusak, atau bukan gambar walau MIME-nya gambar | tolak file |
+| 502 / 504 | — | halaman HTML nginx | service mati/restart, atau timeout | ulangi dengan jeda |
+| — | — | — | koneksi gagal / timeout di sisi client | ulangi dengan jeda |
+
+Catatan untuk client:
+
+- **Tentukan kebijakan saat service gagal** (5xx, timeout, koneksi gagal): *fail-closed* (tolak upload) lebih aman untuk aplikasi sekolah/anak; *fail-open* (terima lalu review manual) lebih ramah pengguna. Jangan diam-diam menganggap gambar lolos.
+- Status `400`, `401`, `403`, `404`, `413`, dan `422` adalah kesalahan request — mengulang request yang sama akan menghasilkan error yang sama.
+- Error dari nginx (`413`, `502`, `504`) berupa HTML, bukan JSON. Periksa status HTTP sebelum `json_decode` / `JSON.parse`.
+- Waktu proses ±100 ms per gambar, tetapi request diproses bergantian. Saat ramai, request akan antre, jadi pakai timeout yang longgar (contoh di atas: 30 detik).
+- Mengecilkan gambar sebelum dikirim (misalnya sisi terpanjang 1000 px) mempercepat upload tanpa menurunkan akurasi berarti, karena model memproses gambar pada 224×224 px.
 
 ## Report
 
 `GET /admin/report` (localhost saja). Tambahkan `?history=1` untuk menyertakan sampel CPU/RAM 2 menit terakhir.
 
 ```bash
-curl -s http://127.0.0.1:3003/admin/report
+curl -s http://127.0.0.1:8005/admin/report
 ```
 
 Isi utama:
@@ -189,7 +496,7 @@ Statistik disimpan di memori dan **reset saat proses restart** (termasuk restart
        client_max_body_size 10m;   # samakan dengan MAX_FILE_SIZE_MB
 
        location / {
-           proxy_pass http://127.0.0.1:3003;
+           proxy_pass http://127.0.0.1:8005;
            proxy_set_header Host $host;
            proxy_set_header X-Real-IP $remote_addr;
            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -204,7 +511,7 @@ Statistik disimpan di memori dan **reset saat proses restart** (termasuk restart
    }
    ```
 
-3. **Firewall**: buka hanya 80/443 (dan SSH). Port 3003 jangan dibuka.
+3. **Firewall**: buka hanya 80/443 (dan SSH). Port 8005 jangan dibuka.
 
    ```bash
    sudo ufw allow OpenSSH && sudo ufw allow 'Nginx Full' && sudo ufw enable
@@ -223,7 +530,7 @@ Statistik disimpan di memori dan **reset saat proses restart** (termasuk restart
 
    ```bash
    npm run keys -- create "Aplikasi A"
-   curl -s http://127.0.0.1:3003/admin/report
+   curl -s http://127.0.0.1:8005/admin/report
    ```
 
 Cloudflare Tunnel (`cloudflared`) juga aman karena selalu mengirim `CF-Connecting-IP` dan `X-Forwarded-For`.
@@ -232,16 +539,102 @@ Belum ada rate limiting per key. Karena inferensi berat di CPU dan request antre
 
 ## PM2 production
 
+### 1. Install PM2
+
 ```bash
+nvm use 12
+npm install -g pm2@5
+pm2 -v
+```
+
+PM2 6.x/7.x resminya butuh Node 16+. PM2 5.x mendukung Node 12 dan sudah diuji dengan project ini. PM2 terpasang per versi Node di nvm, jadi install saat versi Node yang akan dipakai production sedang aktif.
+
+### 2. Jalankan service
+
+```bash
+cd /path/ke/NSFWJS
 npm install --production
+cp .env.example .env
 pm2 start ecosystem.config.js
-pm2 save
-pm2 startup
+pm2 status
+curl -s http://127.0.0.1:8005/health
 ```
 
 `npm ci` tidak dipakai karena repo ini tidak menyimpan `package-lock.json`.
 
-Konfigurasi port default adalah `3003`; override dengan environment variable `PORT`.
+Tunggu sampai `/health` menunjukkan `"model_loaded": true` (beberapa detik).
+
+### 3. Nyala otomatis saat server restart
+
+```bash
+pm2 startup systemd
+```
+
+Perintah ini **tidak langsung memasang apa pun** — ia mencetak satu perintah `sudo` yang harus disalin dan dijalankan, bentuknya kira-kira:
+
+```bash
+sudo env PATH=$PATH:/home/yayan/.nvm/versions/node/v12.22.1/bin /home/yayan/.nvm/versions/node/v12.22.1/lib/node_modules/pm2/bin/pm2 startup systemd -u yayan --hp /home/yayan
+```
+
+Setelah itu simpan daftar proses yang sedang berjalan — inilah yang dihidupkan kembali saat boot:
+
+```bash
+pm2 save
+```
+
+Verifikasi:
+
+```bash
+systemctl status pm2-yayan
+```
+
+```bash
+sudo reboot
+```
+
+Setelah server hidup lagi, cek `pm2 status` dan `curl -s http://127.0.0.1:8005/health`.
+
+Hal yang perlu diingat:
+
+- `pm2 save` harus dijalankan ulang setiap kali daftar proses berubah (menambah/menghapus app). Restart biasa tidak perlu.
+- Unit systemd menyimpan path Node dari nvm. Kalau versi Node diganti (`nvm use 16`, dll.), pasang ulang: `pm2 unstartup systemd`, lalu ulangi langkah 3.
+- Jalankan `pm2` sebagai user biasa, bukan `sudo pm2 ...` — daemon root terpisah dari daemon user dan daftar prosesnya berbeda.
+
+### Operasional sehari-hari
+
+```bash
+pm2 status
+pm2 logs nsfw-moderation-api
+pm2 monit
+pm2 restart nsfw-moderation-api
+```
+
+Setelah mengubah `.env`, cukup `pm2 restart nsfw-moderation-api` — `.env` dibaca ulang saat proses start. Hindari `--update-env`: opsi itu menyuntikkan environment shell saat ini ke proses, dan karena `dotenv` tidak menimpa env yang sudah ada, variabel dari shell bisa mengalahkan `.env`. Perubahan API key **tidak** perlu restart.
+
+Update kode:
+
+```bash
+git pull
+npm install --production
+pm2 restart nsfw-moderation-api
+```
+
+Rotasi log, supaya file log di `~/.pm2/logs` tidak membengkak:
+
+```bash
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 7
+```
+
+### Tentang `ecosystem.config.js`
+
+- `PORT`/`HOST` **tidak** diset di file ini. `dotenv` tidak menimpa environment yang sudah ada, jadi nilai di ecosystem akan mengalahkan `.env` — misalnya `HOST=127.0.0.1` untuk deploy di belakang nginx jadi tidak berlaku. Atur keduanya di `.env`.
+- `cwd: __dirname` memastikan `.env` dan `data/api-keys.json` terbaca dari folder project, termasuk saat dihidupkan otomatis waktu boot.
+- `max_memory_restart: 1G` — pemakaian RAM terukur ±500–900 MB; naikkan jika sering restart (cek kolom `↺` di `pm2 status`). Restart mereset statistik `/admin/report`.
+- `min_uptime`, `max_restarts`, `restart_delay` mencegah restart beruntun tanpa jeda kalau service gagal start (misalnya model tidak bisa diunduh).
+
+Port diatur lewat `PORT` di `.env` (`.env.example`: `8005`). Jika `PORT` tidak diset sama sekali, service memakai `3003`.
 
 ## Development di macOS (Apple Silicon) dengan Node 12
 
@@ -305,3 +698,44 @@ ROSETTA_ADVERTISE_AVX=1 npm run dev
 | `GLIBCXX_3.4.xx not found` (CentOS 7) | `libstdc++` sistem terlalu tua | pasang `devtoolset`, atau arahkan `LD_LIBRARY_PATH` ke `libstdc++` yang lebih baru |
 | `404` saat unduh `CPU-darwin-4.22.0.tar.gz` | tidak ada binding prebuilt macOS | ikuti langkah build macOS di atas |
 | `FATAL: kernel too old` di container | base image modern di kernel 2.6.x | server tidak bisa dipakai; lihat tabel syarat server |
+
+
+## Akses admin dari laptop (SSH tunnel)
+
+Route `/admin/*` hanya bisa diakses dari localhost server. Dengan SSH tunnel, request dari laptop diteruskan oleh `sshd` di server ke `127.0.0.1`, sehingga dianggap localhost — report dan pengelolaan key bisa dibuka dari laptop **tanpa membuka port apa pun ke internet**.
+
+Format `-L <port-laptop>:127.0.0.1:<PORT-di-server>`. Port kanan harus sama dengan `PORT` service di server (`8005` sesuai `.env.example`); port kiri bebas, asal belum dipakai di laptop. Kalau di laptop juga sedang menjalankan service ini di 8005, ganti port kiri, misalnya `18005:127.0.0.1:8005`, lalu akses `http://127.0.0.1:18005`.
+
+Login SSH sekaligus tunnel (tunnel tertutup saat keluar dari shell):
+
+```bash
+ssh -L 8005:127.0.0.1:8005 user@192.168.1.10
+```
+
+Tunnel saja, tanpa shell (terminal tertahan sampai `Ctrl+C`):
+
+```bash
+ssh -N -L 8005:127.0.0.1:8005 user@192.168.1.10
+```
+
+Tunnel di background (terminal langsung bisa dipakai lagi):
+
+```bash
+ssh -f -N -o ExitOnForwardFailure=yes -L 8005:127.0.0.1:8005 user@192.168.1.10
+```
+
+`ExitOnForwardFailure=yes` membuat ssh langsung gagal kalau port 8005 di laptop sudah terpakai. Tanpa opsi ini, ssh tetap jalan di background tanpa tunnel dan tidak ada pesan error.
+
+Lalu dari laptop:
+
+```bash
+curl -s http://127.0.0.1:8005/admin/report
+```
+
+Menutup tunnel background:
+
+```bash
+pkill -f "ssh -f -N -o ExitOnForwardFailure=yes -L 8005"
+```
+
+Tunnel yang benar tidak mengirim header `X-Forwarded-For`, jadi tetap terhitung localhost. Kalau yang diteruskan adalah port nginx (443/80), request akan membawa header proxy dan diperlakukan sebagai akses dari luar.
