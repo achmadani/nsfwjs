@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NSFW Moderation · Dashboard</title>
+  <link rel="stylesheet" href="/admin/dashboard/styles.css">
+  <script src="/admin/dashboard/theme.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="m8.5 12 2.5 2.5 4.5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div>
+        <h1>NSFW Moderation</h1>
+        <p class="brand-sub" id="service-line">Memuat…</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="status" id="status" data-state="loading">
+        <span class="status-icon" aria-hidden="true"></span>
+        <span class="status-label">Menghubungkan…</span>
+      </span>
+      <span class="updated" id="updated" aria-live="polite"></span>
+      <label class="control">
+        <span class="visually-hidden">Interval refresh</span>
+        <select id="refresh">
+          <option value="2000">Refresh 2 dtk</option>
+          <option value="5000">Refresh 5 dtk</option>
+          <option value="10000">Refresh 10 dtk</option>
+          <option value="0">Jeda</option>
+        </select>
+      </label>
+      <button class="icon-button" id="theme-toggle" type="button" aria-label="Ganti tema">
+        <svg class="icon-sun" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="is-loading">
+    <section class="section">
+      <div class="section-head">
+        <h2>Ringkasan</h2>
+        <p>Kumulatif sejak service start · <span id="since"></span></p>
+      </div>
+      <div class="overview">
+        <article class="hero card">
+          <p class="hero-label">Gambar dimoderasi</p>
+          <p class="hero-value" id="hero-value">–</p>
+          <div class="hero-split">
+            <div><span class="key key-rect" style="--c: var(--series-1)"></span><span class="hero-split-label">Lolos</span><strong id="hero-safe">–</strong></div>
+            <div><span class="key key-rect" style="--c: var(--series-2)"></span><span class="hero-split-label">Diblokir NSFW</span><strong id="hero-nsfw">–</strong></div>
+            <div><span class="key key-rect" style="--c: var(--series-3)"></span><span class="hero-split-label">Error</span><strong id="hero-errors">–</strong></div>
+          </div>
+          <div class="ratio" id="hero-ratio" role="img" aria-label="Proporsi hasil moderasi"></div>
+        </article>
+        <div class="tiles" id="tiles"></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>Aktivitas</h2>
+        <p>Riwayat disimpan di memori server, maksimal 15 menit terakhir.</p>
+      </div>
+      <div class="filters" role="group" aria-label="Rentang waktu grafik">
+        <span class="filters-label">Rentang</span>
+        <button type="button" class="chip" data-range="60">1 menit</button>
+        <button type="button" class="chip" data-range="300" aria-pressed="true">5 menit</button>
+        <button type="button" class="chip" data-range="900">15 menit</button>
+      </div>
+      <div class="grid grid-2">
+        <article class="card" data-card="cpu">
+          <header class="card-head">
+            <div><h3>CPU proses</h3><p class="card-sub" id="cpu-sub">100% = satu core penuh</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="legend" data-legend></div>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+        <article class="card" data-card="memory">
+          <header class="card-head">
+            <div><h3>Memori proses</h3><p class="card-sub">MB</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="legend" data-legend></div>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+        <article class="card" data-card="throughput">
+          <header class="card-head">
+            <div><h3>Request masuk</h3><p class="card-sub" id="throughput-sub">per interval</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="legend" data-legend></div>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+        <article class="card" data-card="moderation-range">
+          <header class="card-head">
+            <div><h3>Hasil moderasi</h3><p class="card-sub" id="moderation-range-sub">dalam rentang</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="chart chart-donut" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>Performa</h2>
+        <p>Kumulatif sejak service start.</p>
+      </div>
+      <div class="grid grid-3">
+        <article class="card span-2" data-card="latency">
+          <header class="card-head">
+            <div><h3>Waktu inferensi</h3><p class="card-sub" id="latency-sub">60 inferensi terakhir · ms</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="stat-row" id="latency-stats"></div>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+        <article class="card" data-card="idle-busy">
+          <header class="card-head">
+            <div><h3>Idle vs busy</h3><p class="card-sub">Rata-rata dan puncak</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="legend" data-legend></div>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>Keamanan & kategori</h2>
+        <p>Kumulatif sejak service start.</p>
+      </div>
+      <div class="grid grid-3">
+        <article class="card" data-card="blocked">
+          <header class="card-head">
+            <div><h3>Request diblokir</h3><p class="card-sub">per alasan</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+        <article class="card" data-card="categories">
+          <header class="card-head">
+            <div><h3>Kategori ter-flag</h3><p class="card-sub">jumlah gambar</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+        <article class="card" data-card="status">
+          <header class="card-head">
+            <div><h3>Status HTTP</h3><p class="card-sub">tidak termasuk route admin</p></div>
+            <div class="view-toggle"><button type="button" data-view="chart" aria-pressed="true">Grafik</button><button type="button" data-view="table">Tabel</button></div>
+          </header>
+          <div class="chart" data-chart></div>
+          <div class="table-view" data-table hidden></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>Client & API key</h2>
+        <p id="keys-summary"></p>
+      </div>
+      <div class="grid grid-2">
+        <article class="card">
+          <header class="card-head"><div><h3>Pemakaian per client</h3><p class="card-sub">termasuk akses dari localhost</p></div></header>
+          <div class="table-wrap" id="clients-table"></div>
+        </article>
+        <article class="card">
+          <header class="card-head"><div><h3>API key</h3><p class="card-sub">kelola dengan <code>npm run keys</code></p></div></header>
+          <div class="table-wrap" id="keys-table"></div>
+        </article>
+        <article class="card span-all">
+          <header class="card-head"><div><h3>Route</h3><p class="card-sub">jumlah request per route</p></div></header>
+          <div class="table-wrap" id="routes-table"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>Service</h2></div>
+      <div class="card info" id="info"></div>
+    </section>
+  </main>
+
+  <div class="tooltip" id="tooltip" role="status" hidden></div>
+  <script src="/admin/dashboard/app.js"></script>
+</body>
+</html>

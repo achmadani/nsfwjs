@@ -3,7 +3,9 @@ const os = require('os');
 
 const MB = 1024 * 1024;
 const DURATION_WINDOW = 1000;
-const HISTORY_SIZE = 120;
+// 15 menit pada interval 1 detik; dipakai grafik dashboard.
+const HISTORY_SIZE = 900;
+const RECENT_INFERENCES = 60;
 // Setelah model termuat, sisa alokasi dan garbage dari proses load masih
 // terlihat beberapa detik; sampel pada rentang ini tidak dihitung sebagai idle.
 const STARTUP_SETTLE_MS = 10000;
@@ -25,6 +27,10 @@ function percentile(sortedValues, p) {
   if (sortedValues.length === 0) return 0;
   const index = Math.min(sortedValues.length - 1, Math.ceil((p / 100) * sortedValues.length) - 1);
   return sortedValues[Math.max(0, index)];
+}
+
+function isAdminPath(requestPath) {
+  return requestPath === '/admin' || requestPath.indexOf('/admin/') === 0;
 }
 
 function hrtimeMs(start) {
@@ -74,10 +80,11 @@ function formatAggregate(aggregate, cores, intervalMs) {
 // Mengukur CPU/RAM proses secara periodik dan mengelompokkan sampel menjadi
 // startup (model belum termuat), idle, dan busy (ada inferensi berjalan).
 class ResourceMonitor {
-  constructor({ intervalMs, isReady, tensorMemory }) {
+  constructor({ intervalMs, isReady, tensorMemory, counters }) {
     this.intervalMs = intervalMs;
     this.isReady = isReady;
     this.tensorMemory = tensorMemory;
+    this.counters = counters || (() => ({}));
     this.cores = os.cpus().length || 1;
     this.inFlight = 0;
     this.busySinceLastSample = false;
@@ -95,6 +102,7 @@ class ResourceMonitor {
       cpuSum: 0,
       cpuMax: 0,
       cpuPercentMax: 0,
+      recent: [],
       last: null
     };
     this.timer = null;
@@ -131,11 +139,13 @@ class ResourceMonitor {
     this.busySinceLastSample = this.inFlight > 0;
 
     const sample = {
-      at: new Date().toISOString(),
+      t: Date.now(),
       state,
+      inFlight: this.inFlight,
       cpuPercent: ((cpu.user + cpu.system) / 1000 / elapsedMs) * 100,
       rss: memory.rss,
-      heapUsed: memory.heapUsed
+      heapUsed: memory.heapUsed,
+      counters: this.counters()
     };
     this.current = sample;
     addToAggregate(this.aggregates[state], sample);
@@ -174,6 +184,8 @@ class ResourceMonitor {
       stats.cpuSum += cpuMs;
       stats.cpuMax = Math.max(stats.cpuMax, cpuMs);
       stats.cpuPercentMax = Math.max(stats.cpuPercentMax, cpuPercent);
+      stats.recent.push({ t: Date.now(), wall_ms: round(wallMs), cpu_ms: round(cpuMs) });
+      if (stats.recent.length > RECENT_INFERENCES) stats.recent.shift();
       stats.last = {
         at: new Date().toISOString(),
         wall_ms: round(wallMs),
@@ -186,7 +198,7 @@ class ResourceMonitor {
     }
   }
 
-  report({ includeHistory }) {
+  report({ includeHistory, historySince }) {
     const memory = process.memoryUsage();
     const stats = this.inference;
     const sorted = stats.durations.slice().sort((a, b) => a - b);
@@ -241,7 +253,8 @@ class ResourceMonitor {
         },
         cpu_ms: { avg: round(avgCpu), max: round(stats.cpuMax) },
         cpu_percent: { avg: avgWall ? round((avgCpu / avgWall) * 100) : 0, max: round(stats.cpuPercentMax) },
-        last: stats.last
+        last: stats.last,
+        recent: stats.recent
       },
       system: {
         load_avg: os.loadavg().map((value) => round(value, 2)),
@@ -251,12 +264,17 @@ class ResourceMonitor {
       }
     };
 
-    if (includeHistory) {
-      result.history = this.history.map((sample) => ({
-        at: sample.at,
+    if (includeHistory || historySince !== undefined) {
+      const since = Number(historySince) || 0;
+      result.history = this.history.filter((sample) => sample.t > since).map((sample) => ({
+        t: sample.t,
+        at: new Date(sample.t).toISOString(),
         state: sample.state,
+        in_flight: sample.inFlight,
         cpu_percent: round(sample.cpuPercent),
-        rss_mb: toMb(sample.rss)
+        rss_mb: toMb(sample.rss),
+        heap_used_mb: toMb(sample.heapUsed),
+        counters: sample.counters
       }));
     }
     return result;
@@ -265,6 +283,8 @@ class ResourceMonitor {
 
 // Menghitung request (lolos/diblokir oleh autentikasi) dan hasil moderasi
 // (gambar lolos/diblokir sebagai NSFW). Disimpan di memori; reset saat restart.
+// Request admin yang diizinkan (dashboard, report) dihitung terpisah agar
+// polling dashboard tidak menggelembungkan angka request masuk.
 class RequestStats {
   constructor() {
     this.startedAt = new Date();
@@ -273,6 +293,7 @@ class RequestStats {
       allowed: 0,
       blocked: 0,
       aborted: 0,
+      admin: 0,
       blocked_by_reason: {},
       by_source: { local: 0, remote: 0 },
       by_status: {},
@@ -291,52 +312,85 @@ class RequestStats {
   middleware() {
     return (request, response, next) => {
       if (request.method === 'OPTIONS') return next();
-      this.requests.total += 1;
-      let finished = false;
-      response.on('finish', () => {
-        finished = true;
-        increment(this.requests.by_status, `${String(response.statusCode).charAt(0)}xx`);
-        let route = '(unmatched)';
-        if (request.access && !request.access.allowed) route = '(rejected)';
-        else if (request.route) route = `${request.method} ${request.baseUrl}${request.route.path}`;
-        increment(this.requests.by_route, route);
-      });
-      response.on('close', () => {
-        if (!finished) this.requests.aborted += 1;
-      });
-      next();
+      let recorded = false;
+      const record = (aborted) => {
+        if (recorded) return;
+        recorded = true;
+        this.record(request, response, aborted);
+      };
+      response.on('finish', () => record(false));
+      response.on('close', () => record(!response.writableFinished));
+      return next();
     };
   }
 
-  recordAccess(access) {
-    this.requests.by_source[access.local ? 'local' : 'remote'] += 1;
-    if (!access.allowed) {
-      this.requests.blocked += 1;
-      increment(this.requests.blocked_by_reason, access.reason);
+  record(request, response, aborted) {
+    const access = request.access;
+    // originalUrl, bukan request.path: middleware yang di-mount (express.static
+    // untuk dashboard) menulis ulang path menjadi relatif terhadap mount-nya.
+    const requestPath = String(request.originalUrl || request.url).split('?')[0];
+    if (access && access.allowed && isAdminPath(requestPath)) {
+      this.requests.admin += 1;
       return;
     }
-    this.requests.allowed += 1;
-    const client = access.client;
-    if (!this.clients[client.id]) {
-      this.clients[client.id] = { name: client.name, requests: 0, moderated: 0, nsfw: 0, last_seen_at: null };
+
+    this.requests.total += 1;
+    if (aborted) this.requests.aborted += 1;
+
+    if (access) {
+      this.requests.by_source[access.local ? 'local' : 'remote'] += 1;
+      if (access.allowed) {
+        this.requests.allowed += 1;
+        const client = this.ensureClient(access.client);
+        client.requests += 1;
+        client.last_seen_at = new Date().toISOString();
+      } else {
+        this.requests.blocked += 1;
+        increment(this.requests.blocked_by_reason, access.reason);
+      }
     }
-    this.clients[client.id].requests += 1;
-    this.clients[client.id].last_seen_at = new Date().toISOString();
+
+    if (aborted) return;
+    increment(this.requests.by_status, `${String(response.statusCode).charAt(0)}xx`);
+    let route = '(unmatched)';
+    if (access && !access.allowed) route = '(rejected)';
+    else if (request.route) route = `${request.method} ${request.baseUrl}${request.route.path}`;
+    increment(this.requests.by_route, route);
   }
 
   recordModeration(access, result) {
     this.moderation.total += 1;
     this.moderation[result.is_nsfw ? 'nsfw' : 'safe'] += 1;
     result.flagged_categories.forEach(({ category }) => increment(this.moderation.flagged_by_category, category));
-    const client = access && access.client && this.clients[access.client.id];
+    const client = access && access.client ? this.ensureClient(access.client) : null;
     if (client) {
       client.moderated += 1;
       if (result.is_nsfw) client.nsfw += 1;
     }
   }
 
+  ensureClient(client) {
+    if (!this.clients[client.id]) {
+      this.clients[client.id] = { name: client.name, requests: 0, moderated: 0, nsfw: 0, last_seen_at: null };
+    }
+    return this.clients[client.id];
+  }
+
   recordModerationError() {
     this.moderation.errors += 1;
+  }
+
+  // Snapshot kumulatif untuk riwayat; dashboard menghitung selisih antar sampel.
+  counters() {
+    return {
+      requests: this.requests.total,
+      allowed: this.requests.allowed,
+      blocked: this.requests.blocked,
+      moderated: this.moderation.total,
+      safe: this.moderation.safe,
+      nsfw: this.moderation.nsfw,
+      errors: this.moderation.errors
+    };
   }
 
   report() {
@@ -350,4 +404,4 @@ class RequestStats {
   }
 }
 
-module.exports = { RequestStats, ResourceMonitor };
+module.exports = { RequestStats, ResourceMonitor, isAdminPath };

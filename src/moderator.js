@@ -49,6 +49,14 @@ class Moderator {
     return tf.memory();
   }
 
+  info() {
+    return {
+      tfjs_version: tf.version.tfjs,
+      backend: this.model ? tf.getBackend() : null,
+      model_source: this.modelPath ? path.resolve(this.modelPath) : 'default hosted model (MobileNetV2)'
+    };
+  }
+
   async classify(buffer) {
     const model = await this.load();
     let imageTensor;

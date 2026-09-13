@@ -70,6 +70,7 @@ Model default dimuat ketika service mulai dan dapat memerlukan akses internet se
 | `POST /moderate` | bebas | butuh API key |
 | `GET /admin/report` | bebas | **403** |
 | `GET/POST /admin/keys`, `DELETE /admin/keys/:id` | bebas | **403** |
+| `GET /admin/dashboard/` (atau `/admin`) | bebas, lewat browser | **403** |
 
 `GET /health` mengembalikan status service dan apakah model sudah selesai dimuat.
 
@@ -426,6 +427,7 @@ Semua error berbentuk `{"error": "...", "code": "..."}`; `code` tidak selalu ada
 | 401 | `invalid_key` | `{"error":"Invalid API key.","code":"invalid_key"}` | key salah atau salah ketik | periksa konfigurasi |
 | 401 | `revoked_key` | `{"error":"API key has been revoked.","code":"revoked_key"}` | key sudah dicabut | minta key baru |
 | 403 | `local_only` | `{"error":"This route is only available from localhost.","code":"local_only"}` | mengakses `/admin/*` dari luar | tidak bisa; route khusus server |
+| 403 | `cross_site` | `{"error":"Cross-origin requests are not allowed.","code":"cross_site"}` | `/admin/*` dengan `Host` bukan localhost atau dari origin lain | akses lewat `127.0.0.1`/`localhost` |
 | 404 | — | `{"error":"Not found."}` | URL atau method salah (misalnya `GET /moderate`) | perbaiki URL/method |
 | 413 | `LIMIT_FILE_SIZE` | `{"error":"File too large","code":"LIMIT_FILE_SIZE"}` | file melebihi `MAX_FILE_SIZE_MB` | kecilkan gambar dulu |
 | 413 | — | halaman HTML nginx | file melebihi `client_max_body_size` nginx | kecilkan gambar dulu |
@@ -443,7 +445,12 @@ Catatan untuk client:
 
 ## Report
 
-`GET /admin/report` (localhost saja). Tambahkan `?history=1` untuk menyertakan sampel CPU/RAM 2 menit terakhir.
+`GET /admin/report` (localhost saja) mengembalikan JSON untuk dikonsumsi sistem lain. Untuk dilihat manusia, pakai [Dashboard](#dashboard).
+
+Parameter opsional:
+
+- `?history=1` — sertakan sampel CPU/RAM dan counter per detik, maksimal 15 menit terakhir.
+- `?history_since=<epoch ms>` — hanya sampel setelah waktu tersebut (dipakai dashboard agar tiap refresh tidak mengunduh ulang semua riwayat).
 
 ```bash
 curl -s http://127.0.0.1:8005/admin/report
@@ -451,14 +458,17 @@ curl -s http://127.0.0.1:8005/admin/report
 
 Isi utama:
 
-- `requests` — `total`, `allowed` (lolos autentikasi), `blocked` (ditolak), `blocked_by_reason`, `by_source` (local/remote), `by_status`, `by_route`. Percobaan ke route yang tidak ada tanpa key tercatat sebagai `(rejected)`.
+- `requests` — `total`, `allowed` (lolos autentikasi), `blocked` (ditolak), `blocked_by_reason`, `by_source` (local/remote), `by_status`, `by_route`. Percobaan ke route yang tidak ada tanpa key tercatat sebagai `(rejected)`. Request admin dari localhost yang diizinkan (dashboard, report, kelola key) **tidak** masuk hitungan ini, melainkan ke `admin`, supaya polling dashboard tidak menggelembungkan angka request masuk. Percobaan akses admin dari luar tetap tercatat sebagai `blocked`.
 - `moderation` — jumlah gambar diproses: `safe` (lolos), `nsfw` (diblokir), `errors`, dan `flagged_by_category`.
 - `clients` — per API key: jumlah request, gambar dimoderasi, jumlah NSFW, terakhir terlihat.
 - `resources`:
   - `idle`, `busy`, `startup` — rata-rata dan peak CPU/RAM per kondisi.
   - `peak` — tertinggi sejak start.
   - `per_inference` — waktu (avg/p50/p95/max) dan CPU saat benar-benar memproses satu gambar. Ini angka yang paling akurat untuk "habis berapa CPU per gambar"; `busy` dirata-rata per detik sehingga lebih rendah.
-  - `current`, `system` — kondisi saat ini, termasuk memori tensor TensorFlow dan `MemAvailable` server.
+  - `current`, `system` — kondisi saat ini, termasuk memori tensor TensorFlow dan `MemAvailable` server (di macOS memakai `os.freemem`, yang tidak akurat).
+  - `history` (opsional) — per detik: `state`, `cpu_percent`, `rss_mb`, `heap_used_mb`, `in_flight`, dan `counters` kumulatif.
+- `keys` — jumlah key total/aktif/dicabut.
+- `service`, `config` — hostname, PID, versi Node/TensorFlow.js, sumber model, threshold, batas ukuran file, dan tipe file.
 
 Cara membaca CPU: `cpu_percent` 100 = satu core penuh (bisa > 100 karena TensorFlow multi-thread); `cpu_percent_all_cores` 100 = semua core penuh.
 
@@ -473,6 +483,31 @@ Contoh hasil pengukuran (Mac M-series via Rosetta, gambar 2000px):
 Inferensi dijalankan berurutan oleh event loop Node, jadi request bersamaan akan antre, bukan diproses paralel.
 
 Statistik disimpan di memori dan **reset saat proses restart** (termasuk restart otomatis PM2). Dengan PM2 cluster/beberapa instance, tiap proses punya report sendiri — karena itu `ecosystem.config.js` memakai 1 instance.
+
+## Dashboard
+
+Tampilan visual dari report: `http://127.0.0.1:8005/admin/dashboard/` (atau cukup `/admin`). Hanya bisa dibuka dari localhost server — dari laptop, pakai [SSH tunnel](#akses-admin-dari-laptop-ssh-tunnel) lalu buka `http://127.0.0.1:8005/admin/dashboard/` di browser.
+
+Isi:
+
+- **Ringkasan** — total gambar dimoderasi (lolos / diblokir NSFW / error), request masuk, tingkat blokir, CPU & RAM saat ini beserta puncaknya, p95 inferensi, memori server, uptime, dan jumlah API key aktif.
+- **Aktivitas** (rentang 1 / 5 / 15 menit) — grafik CPU dengan penanda saat sedang memproses, memori (RSS & heap), request per interval (lolos vs diblokir), dan hasil moderasi dalam rentang.
+- **Performa** — waktu 60 inferensi terakhir dengan garis p95, perbandingan CPU/RAM saat idle vs busy.
+- **Keamanan & kategori** — request diblokir per alasan, kategori yang ter-flag, status HTTP.
+- **Client & API key** — pemakaian per client, daftar key (hanya prefix), dan request per route.
+- **Service** — konfigurasi dan versi yang sedang berjalan.
+
+Setiap grafik punya tombol **Tabel** untuk melihat angka persisnya, dan tooltip saat kursor diarahkan. Dashboard refresh otomatis (2/5/10 detik atau dijeda), mengikuti tema terang/gelap sistem dengan tombol untuk menggantinya, dan menjeda polling saat tab tidak terlihat. Kalau server tidak bisa dihubungi, status berubah menjadi **Terputus** dan data terakhir tetap ditampilkan dengan warna redup.
+
+Dashboard tidak memuat apa pun dari internet (tanpa CDN), jadi tetap jalan di server tanpa akses keluar. File-nya ada di `src/dashboard/`.
+
+**Keamanan route admin.** Karena dashboard dibuka lewat browser, route `/admin/*` punya pengaman tambahan selain cek localhost:
+
+- Header `Host` wajib `localhost`, `127.0.0.1`, atau `[::1]` — mencegah *DNS rebinding* (domain milik orang lain yang diarahkan ke 127.0.0.1).
+- Request dengan `Origin` berbeda atau `Sec-Fetch-Site: cross-site` ditolak, dan CORS tidak aktif untuk `/admin` — situs lain yang terbuka di browser yang sama tidak bisa membaca report atau membuat key (*CSRF*).
+- Ditolak dengan `403` dan `code: "cross_site"`.
+
+Konsekuensinya, akses admin memakai hostname server (misalnya `curl http://nama-server:8005/admin/report` dari server itu sendiri) ditolak — pakai `127.0.0.1` atau `localhost`.
 
 ## Deploy ke internet (Linux)
 
@@ -726,7 +761,13 @@ ssh -f -N -o ExitOnForwardFailure=yes -L 8005:127.0.0.1:8005 user@192.168.1.10
 
 `ExitOnForwardFailure=yes` membuat ssh langsung gagal kalau port 8005 di laptop sudah terpakai. Tanpa opsi ini, ssh tetap jalan di background tanpa tunnel dan tidak ada pesan error.
 
-Lalu dari laptop:
+Lalu dari laptop, buka dashboard di browser:
+
+```
+http://127.0.0.1:8005/admin/dashboard/
+```
+
+Atau ambil JSON-nya:
 
 ```bash
 curl -s http://127.0.0.1:8005/admin/report

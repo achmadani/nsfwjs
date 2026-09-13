@@ -1,5 +1,7 @@
 require('dotenv').config();
 
+const os = require('os');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -7,7 +9,8 @@ const multer = require('multer');
 const Moderator = require('./moderator');
 const KeyStore = require('./keyStore');
 const { createAccessMiddleware } = require('./access');
-const { RequestStats, ResourceMonitor } = require('./stats');
+const { RequestStats, ResourceMonitor, isAdminPath } = require('./stats');
+const packageInfo = require('../package.json');
 
 function parseBoolean(value, defaultValue) {
   if (value === undefined || value === '') return defaultValue;
@@ -45,8 +48,10 @@ const stats = new RequestStats();
 const monitor = new ResourceMonitor({
   intervalMs: resourceSampleMs,
   isReady: () => moderator.isReady(),
-  tensorMemory: () => (moderator.isReady() ? moderator.tensorMemory() : null)
+  tensorMemory: () => (moderator.isReady() ? moderator.tensorMemory() : null),
+  counters: () => stats.counters()
 });
+const corsMiddleware = cors();
 
 app.disable('x-powered-by');
 // Hanya dipakai untuk menampilkan IP client (request.ip); tidak dipakai untuk
@@ -54,12 +59,13 @@ app.disable('x-powered-by');
 app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
 app.use(stats.middleware());
 app.use(helmet());
-app.use(cors());
+// CORS hanya untuk API publik. Route admin sengaja tidak diberi CORS agar
+// halaman dari origin lain tidak bisa membaca atau mengubah data admin.
+app.use((request, response, next) => (isAdminPath(request.path) ? next() : corsMiddleware(request, response, next)));
 // Autentikasi dijalankan sebelum body diparse/diupload, supaya request tanpa
 // key tidak sempat membebani memori server.
 app.use(createAccessMiddleware({
   keyStore,
-  stats,
   localBypass,
   localOnlyPrefixes: ['/admin']
 }));
@@ -97,16 +103,51 @@ app.post('/moderate', upload.single('image'), async (request, response, next) =>
 
 // ---- Route khusus localhost ----
 
+app.get('/admin', (request, response) => {
+  response.redirect('/admin/dashboard/');
+});
+
+app.use('/admin/dashboard', express.static(path.join(__dirname, 'dashboard'), { index: 'index.html', maxAge: 0 }));
+
 app.get('/admin/report', (request, response) => {
+  const keys = keyStore.list();
+  response.set('Cache-Control', 'no-store');
   response.json({
     generated_at: new Date().toISOString(),
     model_loaded: moderator.isReady(),
     ...stats.report(),
-    resources: monitor.report({ includeHistory: parseBoolean(request.query.history, false) })
+    resources: monitor.report({
+      includeHistory: parseBoolean(request.query.history, false),
+      historySince: request.query.history_since
+    }),
+    keys: {
+      total: keys.length,
+      active: keys.filter((key) => key.active).length,
+      revoked: keys.filter((key) => !key.active).length
+    },
+    service: {
+      name: packageInfo.name,
+      version: packageInfo.version,
+      hostname: os.hostname(),
+      pid: process.pid,
+      node_version: process.version,
+      platform: `${process.platform}/${process.arch}`,
+      ...moderator.info()
+    },
+    config: {
+      port,
+      host,
+      local_bypass: localBypass,
+      thresholds: moderator.thresholds,
+      max_file_size_mb: maxFileSize / 1024 / 1024,
+      allowed_mime_types: Array.from(allowedMimeTypes),
+      resource_sample_ms: resourceSampleMs
+    }
   });
 });
 
 app.get('/admin/keys', (request, response) => {
+  response.set('Cache-Control', 'no-store');
   response.json({ keys: keyStore.list() });
 });
 
